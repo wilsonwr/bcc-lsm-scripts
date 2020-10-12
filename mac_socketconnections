@@ -1,0 +1,227 @@
+#!/usr/bin/python
+#
+# mac_socketconnections     Restrict IPv4 socket connections.
+#                           No Unix or IPv6 socket support (yet).
+#
+# 10-Oct-2020   Billy Wilson    Created this.
+
+from bcc import BPF
+from bcc.utils import printb
+import argparse
+import datetime
+import pwd
+import socket
+import struct
+
+
+def parse_uid(user):
+    """
+    Check if valid UID or username is provided
+    """
+    try:
+        result = int(user)
+    except ValueError:
+        try:
+            user_info = pwd.getpwnam(user)
+        except KeyError:
+            raise argparse.ArgumentTypeError(
+                "{0!r} is not valid UID or user entry".format(user))
+        else:
+            return user_info.pw_uid
+    else:
+        # Maybe validate if UID < 0 ?
+        return result
+
+
+def ip2long(ip):
+    """
+    Convert an IP string to a long
+    """
+    packedIP = socket.inet_aton(ip)
+    return struct.unpack("!L", packedIP)[0]
+
+
+def long2ip(num):
+    """
+    Convert a long to an IP string
+    """
+    return socket.inet_ntoa(struct.pack("!L", num))
+
+
+# Set up argument parser
+examples = """examples:
+    ./mac_socketconnections -A 192.168.15.0 -m 255.255.255.0 # Only allow socket connections to 192.168.15.0/24
+    ./mac_socketconnections -A 1.2.3.4 -u 1000               # Only allow UID 1000 to make socket connections to 1.2.3.4
+    ./mac_socketconnections -A 1.2.3.4 -U 1000               # Allow any UID except 1000 to make socket connections to 1.2.3.4
+    ./mac_socketconnections -D 10.1.2.3                      # Deny all socket connections to 10.1.2.3
+"""
+
+parser = argparse.ArgumentParser(
+    description="Dynamically load a MAC policy for socket connections",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=examples)
+parser.add_argument("ip", type=str,
+    help="the target IP for an allow/deny policy")
+parser.add_argument("-m", "--mask", metavar="MASK", default="255.255.255.255",
+    help="the subnet mask for an allow/deny policy")
+mode = parser.add_mutually_exclusive_group(required=True)
+mode.add_argument("-A", "--allow", action="store_true",
+    help="define an allow policy")
+mode.add_argument("-D", "--deny", action="store_true",
+    help="define a deny policy")
+user_control = parser.add_mutually_exclusive_group()
+user_control.add_argument("-u", "--user", type=parse_uid, metavar="USER",
+    help="apply the policy to a specific user")
+user_control.add_argument("-U", "--exclude-user", type=parse_uid, metavar="EXCLUDED_USER",
+    help="exclude a specific user from the policy")
+args = parser.parse_args()
+
+
+# BPF program (in C)
+bpf_text = """
+#include <net/sock.h>
+#include <linux/inet.h>
+#include <linux/errno.h>
+
+#define __LOWER(x) (x & 0xffffffff)
+#define __UPPER(x) (x >> 32)
+#define __SWAP16(x) (x >> 8) | ((x << 8) & 0x00ff00)
+#define __SWAP32(x) ((x >> 24) & 0xff) |     \
+                    ((x << 8) & 0xff0000) |  \
+                    ((x >> 8) & 0xff00) |    \
+                    ((x << 24) & 0xff000000)
+
+/*
+ * Create a data structure for collecting event data
+ */
+struct data_t {
+    char comm[TASK_COMM_LEN];
+    u32 uid;
+    u32 gid;
+    u32 pid;
+    u16 sk_protocol;
+    long daddr;
+    short dport;
+    int allowed;
+};
+
+/*
+ * Create a buffer for sending event data to userspace
+ */
+BPF_PERF_OUTPUT(events);
+
+/*
+ * Attach to the "socket_connect" LSM hook
+ */
+LSM_PROBE(socket_connect, struct socket *sock, struct sockaddr *address,
+    int addrlen) {
+
+    long filter_addr;
+    long filter_netmask;
+    u64 gid_uid;
+    u64 pid_tgid;
+    int allowed;
+    struct sockaddr_in *addr_in;
+
+    /*
+     * IP subnet filter (Populated by Python script)
+     */
+    filter_addr = FILTER_ADDR;
+    filter_netmask = FILTER_NETMASK;
+
+
+    /* 
+     * Examine IPv4 socket connections only (for now)
+     */
+    if (addrlen == sizeof(struct sockaddr_in)) {
+        addr_in = (struct sockaddr_in *)address;
+
+        /*
+         * Gather event data
+         */
+        struct data_t data = {};
+        gid_uid = bpf_get_current_uid_gid();
+        pid_tgid = bpf_get_current_pid_tgid();
+        bpf_get_current_comm(&data.comm, sizeof(data.comm));
+        data.uid = __LOWER(gid_uid);
+        data.gid = __UPPER(gid_uid);
+        data.pid = __UPPER(pid_tgid);
+        data.sk_protocol = sock->sk->sk_protocol;
+        data.daddr = __SWAP32(addr_in->sin_addr.s_addr);
+        data.dport = __SWAP16(addr_in->sin_port);
+
+        /*
+         * Subnet filter and optional filters (Populated by Python script)
+         */
+        if (
+        (data.daddr & filter_netmask) ALLOW_OR_DENY (filter_addr & filter_netmask)
+        UID_FILTER
+        ) {
+            data.allowed = 0;
+            events.perf_submit(ctx, &data, sizeof(data));
+            return -EPERM;
+        } else {
+            data.allowed = 1;
+            events.perf_submit(ctx, &data, sizeof(data));
+            return 0;
+        }
+    }
+    return 0;
+}
+"""
+
+
+# Convert IP and subnet to long integers for the BPF program
+ip = ip2long(args.ip)
+mask = ip2long(args.mask)
+bpf_text = bpf_text.replace('FILTER_ADDR', str(ip));
+bpf_text = bpf_text.replace('FILTER_NETMASK', str(mask));
+
+
+# Populate filters in the BPF program, based on options passed to this script
+if args.user:
+    bpf_text = bpf_text.replace('UID_FILTER', '&& (data.uid ALLOW_OR_DENY %s)' % args.user)
+elif args.exclude_user:
+    bpf_text = bpf_text.replace('UID_FILTER', '&& (data.uid INVERSE %s)' % args.exclude_user)
+else:
+    bpf_text = bpf_text.replace('UID_FILTER', '')
+
+if args.allow:
+    bpf_text = bpf_text.replace('ALLOW_OR_DENY', '!=')
+    bpf_text = bpf_text.replace('INVERSE', '==')
+elif args.deny:
+    bpf_text = bpf_text.replace('ALLOW_OR_DENY', '==')
+    bpf_text = bpf_text.replace('INVERSE', '!=')
+
+
+# Compile the BPF program and attach it to the LSM hook
+b = BPF(text=bpf_text)
+
+
+def print_event(cpu, data, size):
+    """
+    Print event data for a socket connection.
+    """
+    event = b["events"].event(data)
+    printb(b"%s type=skconn comm=%s uid=%d gid=%d pid=%d proto=%d daddr=%s dport=%d action=%s" % (
+        datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        event.comm,
+        event.uid,
+        event.gid,
+        event.pid, 
+        event.sk_protocol,
+        long2ip(event.daddr),
+        event.dport,
+        "allow" if event.allowed else "deny"))
+
+
+# Setup callback function for the buffer
+b["events"].open_perf_buffer(print_event)
+
+
+# Poll for incoming events
+while 1:
+    try:
+        b.perf_buffer_poll()
+    except KeyboardInterrupt:
+        exit()

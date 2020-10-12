@@ -1,0 +1,227 @@
+#!/usr/bin/python
+#
+# mac_suidexec  Restrict the execution of SUID binaries.
+#
+# 10-Oct-2020   Billy Wilson    Created this.
+
+from bcc import BPF
+from bcc.utils import printb
+import argparse
+import datetime
+import grp
+import os
+import pwd
+import stat
+
+
+def parse_uid(user):
+    """
+    Check if valid UID or username is provided
+    """
+    try:
+        result = int(user)
+    except ValueError:
+        try:
+            user_info = pwd.getpwnam(user)
+        except KeyError:
+            raise argparse.ArgumentTypeError(
+                "{0!r} is not valid UID or user entry".format(user))
+        else:
+            return user_info.pw_uid
+    else:
+        # Maybe validate if UID < 0 ?
+        return result
+
+
+# Set up argument parser
+examples = """examples:
+    ./mac_suidexec -A                   # Allow execution of all SUID binaries
+    ./mac_suidexec -A -u 1000           # Allow only UID 1000 to execute SUID binaries
+    ./mac_suidexec -A -U 1000           # Allow all UIDs except 1000 to execute SUID binaries
+    ./mac_suidexec -A -f /bin/passwd    # Allow only the /bin/sudo SUID binary to execute
+    ./mac_suidexec -A -F /bin/sudo      # Allow all SUID binaries to execute except /bin/sudo
+    ./mac_suidexec -D                   # Deny execution of all SUID binaries
+    ./mac_suidexec -D -u 1000           # Deny UID 1000 from executing SUID binaries
+    ./mac_suidexec -D -U 0              # Deny all UIDs except 0 from executing SUID binaries
+    ./mac_suidexec -D -f /bin/chsh      # Deny the /bin/chsh SUID binary from executing
+    ./mac_suidexec -D -F /bin/newgrp    # Deny all SUID binaries from executing except /bin/newgrp
+"""
+
+parser = argparse.ArgumentParser(
+    description="Dynamically load a MAC policy for committing new credentials",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=examples)
+mode = parser.add_mutually_exclusive_group(required=True)
+mode.add_argument("-A", "--allow", action="store_true",
+    help="define an allow policy")
+mode.add_argument("-D", "--deny", action="store_true",
+    help="define a deny policy")
+user_control = parser.add_mutually_exclusive_group()
+user_control.add_argument("-u", "--user", type=parse_uid, metavar="USER",
+    help="apply the policy to a specific user")
+user_control.add_argument("-U", "--exclude-user", type=parse_uid, metavar="EXCLUDED_USER",
+    help="exclude a specific user from the policy")
+file_control = parser.add_mutually_exclusive_group()
+file_control.add_argument("-f", "--file", metavar="FILE", dest="file_path",
+    help="apply the policy to a file")
+file_control.add_argument("-F", "--exclude-file", metavar="EXCLUDED_FILE",
+    help="exclude a file from the policy")
+
+args = parser.parse_args()
+
+
+# BPF program (in C)
+bpf_text = """
+#include <linux/binfmts.h>
+#include <linux/cred.h>
+#include <linux/fs.h>
+#include <linux/errno.h>
+
+#define __LOWER(x) (x & 0xffffffff)
+#define __UPPER(x) (x >> 32)
+
+/*
+ * Create a data structure for collecting event data
+ */
+struct data_t {
+    char comm[TASK_COMM_LEN];
+    u32 uid;
+    u32 gid;
+    u32 pid;
+    u32 dev;
+    unsigned long inode;
+    unsigned short mode;
+    int allowed;
+};
+
+/*
+ * Create a buffer for sending event data to userspace
+ */
+BPF_PERF_OUTPUT(events);
+
+/*
+ * Attach to the "bprm_check_security" LSM hook
+ */
+LSM_PROBE(bprm_check_security, struct linux_binprm *bprm) {
+    
+    u64 gid_uid;
+    u64 pid_tgid;
+    unsigned short mode;
+
+    /*
+     * Check if executable has its SUID bit set
+     */
+    mode = bprm->file->f_inode->i_mode;
+    if (mode & S_ISUID) {
+
+        /*
+         * Gather event data
+         */
+        struct data_t data = {};
+        u64 gid_uid = bpf_get_current_uid_gid();
+        u64 pid_tgid = bpf_get_current_pid_tgid();
+        bpf_get_current_comm(&data.comm, sizeof(data.comm));
+        data.uid = __LOWER(gid_uid);
+        data.gid = __UPPER(gid_uid);
+        data.pid = __UPPER(pid_tgid);
+        data.dev = bprm->file->f_inode->i_sb->s_dev;
+        data.inode = bprm->file->f_inode->i_ino;
+        data.mode = mode;
+
+        /*
+         * Optional filters (Populated by Python script)
+         */
+        if (
+        1
+        UID_FILTER
+        FILE_FILTER
+        ) {
+            data.allowed = 0;
+            events.perf_submit(ctx, &data, sizeof(data));
+            return -EPERM;
+        } else {
+            data.allowed = 1;
+            events.perf_submit(ctx, &data, sizeof(data));
+        }
+    }
+    return 0;
+}
+"""
+
+
+# Populate filters in the BPF program, based on options passed to this script
+if args.allow:
+    if args.user:
+        bpf_text = bpf_text.replace('UID_FILTER',
+                                    '&& (data.uid != %s)' % args.user)
+    elif args.exclude_user:
+        bpf_text = bpf_text.replace('UID_FILTER',
+                                    '&& (data.uid == %s)' % args.exclude_user)
+    else:
+        bpf_text = bpf_text.replace('UID_FILTER', '')
+
+    if args.file_path:
+        file_o = os.lstat(args.file_path)
+        bpf_text = bpf_text.replace('FILE_FILTER',
+                                    '&& !((data.dev == %s) && (data.inode == %s))' % (file_o.st_dev, file_o.st_ino))
+    elif args.exclude_file:
+        file_o = os.lstat(args.exclude_file)
+        bpf_text = bpf_text.replace('FILE_FILTER',
+                                    '&& (data.dev == %s) && (data.inode == %s)' % (file_o.st_dev, file_o.st_ino))
+    else:
+        bpf_text = bpf_text.replace('FILE_FILTER', '')
+
+elif args.deny:
+    if args.user:
+        bpf_text = bpf_text.replace('UID_FILTER',
+                                    '&& (data.uid == %s)' % args.user)
+    elif args.exclude_user:
+        bpf_text = bpf_text.replace('UID_FILTER',
+                                    '&& (data.uid != %s)' % args.exclude_user)
+    else:
+        bpf_text = bpf_text.replace('UID_FILTER', '')
+
+    if args.file_path:
+        file_o = os.lstat(args.file_path)
+        bpf_text = bpf_text.replace('FILE_FILTER',
+                                    '&& (data.dev == %s) && (data.inode == %s)' % (file_o.st_dev, file_o.st_ino))
+    elif args.exclude_file:
+        file_o = os.lstat(args.exclude_file)
+        bpf_text = bpf_text.replace('FILE_FILTER',
+                                    '&& !((data.dev == %s) && (data.inode == %s))' % (file_o.st_dev, file_o.st_ino))
+    else:
+        bpf_text = bpf_text.replace('FILE_FILTER', '')
+
+
+# Compiler the BPF program and attach it to the LSM hook
+b = BPF(text=bpf_text)
+
+
+def print_event(cpu, data, size):
+    """
+    Print event data when a SUID binary is about to be
+    executed.
+    """
+    event = b["events"].event(data)
+    printb(b"%s type=exsuid comm=%s uid=%d gid=%d pid=%d dev=%d inode=%lu mode=%o action=%s" % (
+    	   datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+           event.comm,
+           event.uid,
+           event.gid,
+           event.pid,
+           event.dev,
+           event.inode,
+           event.mode,
+           "allow" if event.allowed else "deny"))
+
+
+#setup callback function for the buffer
+b["events"].open_perf_buffer(print_event)
+
+
+# Poll for incoming events
+while 1:
+    try:
+        b.perf_buffer_poll()
+    except KeyboardInterrupt:
+        exit()

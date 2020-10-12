@@ -1,0 +1,263 @@
+#!/usr/bin/python
+#
+# mac_fileperms     Restrict the addition of SUID and WOTH
+#                   bits to new and existing files.
+#
+# 10-Oct-2020   Billy Wilson    Created this.
+
+from bcc import BPF
+from bcc.utils import printb
+import argparse
+import datetime
+import pwd
+
+
+def parse_uid(user):
+    """
+    Check if valid UID or username is provided
+    """
+    try:
+        result = int(user)
+    except ValueError:
+        try:
+            user_info = pwd.getpwnam(user)
+        except KeyError:
+            raise argparse.ArgumentTypeError(
+                "{0!r} is not valid UID or user entry".format(user))
+        else:
+            return user_info.pw_uid
+    else:
+        # Maybe validate if UID < 0 ?
+        return result
+
+
+# Set up argument parser
+examples = """examples:
+    ./mac_fileperms -A                 # Allow all SUID/WOTH permission bit additions
+    ./mac_fileperms -A -u 1000         # Allow only UID 1000 to add SUID/WOTH permission bits
+    ./mac_fileperms -A -U 1000         # Allow all UIDs except 1000 to add SUID/WOTH permission bits
+    ./mac_fileperms -D                 # Deny all SUID/WOTH permission bit additions
+    ./mac_fileperms -D -u 1000         # Deny only UID 1000 from adding SUID/WOTH permission bits
+    ./mac_fileperms -D -U 1000         # Deny all UIDs except 1000 from adding SUID/WOTH permission bits
+"""
+
+parser = argparse.ArgumentParser(
+    description="Dynamically load a MAC policy for socket listen operations",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=examples)
+mode = parser.add_mutually_exclusive_group(required=True)
+mode.add_argument("-A", "--allow", action="store_true",
+    help="define an allow policy")
+mode.add_argument("-D", "--deny", action="store_true",
+    help="define a deny policy")
+user_control = parser.add_mutually_exclusive_group()
+user_control.add_argument("-u", "--user", type=parse_uid, metavar="USER",
+    help="apply the policy to a specific user")
+user_control.add_argument("-U", "--exclude-user", type=parse_uid, metavar="EXCLUDED_USER",
+    help="exclude a specific user from the policy")
+
+args = parser.parse_args()
+
+
+# BPF program (in C)
+bpf_text = """
+#include <linux/fs.h>
+#include <linux/fs_struct.h>
+#include <linux/errno.h>
+
+#define __LOWER(x) (x & 0xffffffff)
+#define __UPPER(x) (x >> 32)
+
+/*
+ * Create a data structure for collecting event data
+ */
+struct data_t {
+    char comm[TASK_COMM_LEN];
+    u32 uid;
+    u32 gid;
+    u32 pid;
+    unsigned short oldmode;
+    unsigned short reqmode;
+    unsigned short newmode;
+    int umask;
+    int allowed;
+};
+
+/*
+ * Create buffers for sending event data to userspace
+ */
+BPF_PERF_OUTPUT(creat_events);
+BPF_PERF_OUTPUT(chmod_events);
+
+/*
+ * Attach to the "inode_create" LSM hook
+ */
+LSM_PROBE(inode_create, struct inode *dir, struct dentry *dentry,
+    umode_t mode) {
+
+    u64 gid_uid;
+    u64 pid_tgid;
+    int umask;
+    int allowed;
+    struct fs_struct *fs;
+    struct task_struct *task;
+
+    /* 
+     * Get the umask of the current task
+     */
+    task = (struct task_struct *)bpf_get_current_task();
+    bpf_probe_read_kernel(&fs, sizeof(fs), &task->fs);
+    bpf_probe_read_kernel(&umask, sizeof(umask), &fs->umask);
+
+    /*
+     * Check if SUID or world-writable bits will be set
+     */
+    if ((mode & ~umask) & (S_ISUID | S_IWOTH)) {
+
+        /*
+         * Gather event data
+         */
+        struct data_t data = {};
+        gid_uid = bpf_get_current_uid_gid();
+        pid_tgid = bpf_get_current_pid_tgid();
+        bpf_get_current_comm(&data.comm, sizeof(data.comm));
+        data.uid = __LOWER(gid_uid);
+        data.gid = __UPPER(gid_uid);
+        data.pid = __UPPER(pid_tgid);
+        data.oldmode = dentry->d_inode->i_mode;
+        data.reqmode = mode;
+        data.umask = umask;
+        data.newmode = mode & ~umask;
+
+        /* 
+         * Optional filters (Populated by Python script)
+         */
+        if (
+        1
+        UID_FILTER
+        ) {
+            data.allowed = 0;
+            creat_events.perf_submit(ctx, &data, sizeof(data));
+            return -EPERM;
+        } else {
+            data.allowed = 1;
+            creat_events.perf_submit(ctx, &data, sizeof(data));
+        }
+    }
+    return 0;
+}
+
+/*
+ * Attach to the "path_chmod" LSM hook
+ */
+LSM_PROBE(path_chmod, const struct path *path, umode_t mode) {
+
+    u64 gid_uid;
+    u64 pid_tgid;
+    int allowed;
+
+    /*
+     * Check if SUID or world-writable bits will be set
+     */
+    if (mode & (S_ISUID | S_IWOTH)) {
+        struct data_t data = {};
+        gid_uid = bpf_get_current_uid_gid();
+        pid_tgid = bpf_get_current_pid_tgid();
+
+        /*
+         * Gather event data
+         */
+        bpf_get_current_comm(&data.comm, sizeof(data.comm));
+        data.uid = __LOWER(gid_uid);
+        data.gid = __UPPER(gid_uid);
+        data.pid = __UPPER(pid_tgid);
+        data.oldmode = path->dentry->d_inode->i_mode;
+        data.newmode = mode;
+
+        /* 
+         * Optional filters (Populated by Python script)
+         */
+        if (
+        1
+        UID_FILTER
+        ) {
+            data.allowed = 0;
+            chmod_events.perf_submit(ctx, &data, sizeof(data));
+            return -EPERM;
+        } else {
+            data.allowed = 1;
+            chmod_events.perf_submit(ctx, &data, sizeof(data));
+        }
+    }
+    return 0;
+}
+"""
+
+
+# Populate filters in the BPF program, based on options passed to this script
+if args.user:
+    bpf_text = bpf_text.replace('UID_FILTER', '&& (data.uid ALLOW_OR_DENY %s)' % args.user)
+elif args.exclude_user:
+    bpf_text = bpf_text.replace('UID_FILTER', '&& (data.uid INVERSE %s)' % args.exclude_user)
+else:
+    bpf_text = bpf_text.replace('UID_FILTER', '')
+
+if args.allow:
+    bpf_text = bpf_text.replace('ALLOW_OR_DENY', '!=')
+    bpf_text = bpf_text.replace('INVERSE', '==')
+elif args.deny:
+    bpf_text = bpf_text.replace('ALLOW_OR_DENY', '==')
+    bpf_text = bpf_text.replace('INVERSE', '!=')
+
+
+# Compile the BPF program and attach it to the LSM hooks
+b = BPF(text=bpf_text)
+
+
+def print_creat_event(cpu, data, size):
+    """
+    Print event data when attempting to create an inode
+    with SUID/WOTH bits.
+    """
+    event = b["creat_events"].event(data)
+    printb(b"%s type=create comm=%s uid=%d gid=%d pid=%d oldmode=%06o reqmode=%06o umask=%06o newmode=%06o action=%s" % (
+        datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        event.comm,
+        event.uid,
+        event.gid,
+        event.pid, 
+        event.oldmode,
+        event.reqmode,
+        event.umask,
+        event.newmode,
+        "allow" if event.allowed else "deny"))
+
+
+def print_chmod_event(cpu, data, size):
+    """
+    Print event data when attempting to add SUID/WOTH bits
+    to an inode.
+    """
+    event = b["creat_events"].event(data)
+    printb(b"%s type=chmode comm=%s uid=%d gid=%d pid=%d oldmode=%06o newmode=%06o action=%s" % (
+        datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        event.comm,
+        event.uid,
+        event.gid,
+        event.pid, 
+        event.oldmode,
+        event.newmode,
+        "allow" if event.allowed else "deny"))
+
+
+# Setup callback functions for each buffer
+b["creat_events"].open_perf_buffer(print_creat_event)
+b["chmod_events"].open_perf_buffer(print_chmod_event)
+
+
+# Poll for incoming events
+while 1:
+    try:
+        b.perf_buffer_poll()
+    except KeyboardInterrupt:
+        exit()
