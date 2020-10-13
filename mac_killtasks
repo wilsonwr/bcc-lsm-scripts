@@ -1,0 +1,254 @@
+#!/usr/bin/python
+#
+# mac_killtasks  Restrict kill signals.
+#
+# 10-Oct-2020   Billy Wilson    Created this.
+
+from bcc import BPF
+from bcc.utils import printb
+import argparse
+import datetime
+import grp
+import os
+import pwd
+import stat
+
+
+def parse_uid(user):
+    """
+    Check if valid UID or username is provided
+    """
+    try:
+        result = int(user)
+    except ValueError:
+        try:
+            user_info = pwd.getpwnam(user)
+        except KeyError:
+            raise argparse.ArgumentTypeError(
+                "{0!r} is not valid UID or user entry".format(user))
+        else:
+            return user_info.pw_uid
+    else:
+        # Maybe validate if UID < 0 ?
+        return result
+
+
+# Set up argument parser
+examples = """examples:
+    ./mac_mac_killtasks -A                   # Allow all SIGTERM/SIGKILL signals
+    ./mac_mac_killtasks -A -u root           # Only allow SIGTERM/SIGKILL signals from root
+    ./mac_mac_killtasks -D                   # Deny all SIGTERM/SIGKILL signals
+    ./mac_mac_killtasks -D -k                # Deny all SIGTERM/SIGKILL signals, including from kernel processes (dangerous)
+    ./mac_mac_killtasks -D -t 3333           # Deny all SIGTERM/SIGKILL signals sent to PID 3333
+    ./mac_mac_killtasks -D -e -t 3333        # Deny all SIGTERM/SIGKILL signals sent to PID 3333, and protect mac_killtasks from termination
+    ./mac_mac_killtasks -D -p 1111           # Deny all SIGTERM/SIGKILL signals sent from PID 1111
+"""
+
+parser = argparse.ArgumentParser(
+    description="Dynamically load a MAC policy for restricting kill signals",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=examples)
+mode = parser.add_mutually_exclusive_group(required=True)
+mode.add_argument("-A", "--allow", action="store_true",
+    help="define an allow policy")
+mode.add_argument("-D", "--deny", action="store_true",
+    help="define a deny policy")
+parser.add_argument("-k", "--kernel", action="store_true",
+    help="Apply the policy to kernel signals as well (dangerous)")
+parser.add_argument("-e", "--eternal", action="store_true",
+    help="Block all kill signals against the process that loaded this policy")
+user_control = parser.add_mutually_exclusive_group()
+user_control.add_argument("-u", "--user", type=parse_uid, metavar="USER",
+    help="apply the policy to a specific user")
+user_control.add_argument("-U", "--exclude-user", type=parse_uid, metavar="EXCLUDED_USER",
+    help="exclude a specific user from the policy")
+pid_control = parser.add_mutually_exclusive_group()
+pid_control.add_argument("-p", "--source-pid", metavar="PID",
+    help="apply the policy to a source pid")
+pid_control.add_argument("-P", "--exclude-source-pid", metavar="EXCLUDED_PID",
+    help="exclude a source pid from the policy")
+target_control = parser.add_mutually_exclusive_group()
+target_control.add_argument("-t", "--target-pid", metavar="PID",
+    help="apply the policy to a target pid")
+target_control.add_argument("-T", "--exclude-target-pid", metavar="EXCLUDED_PID",
+    help="exclude a target pid from the policy")
+
+args = parser.parse_args()
+
+
+# BPF program (in C)
+bpf_text = """
+#include <linux/cred.h>
+#include <linux/sched.h>
+#include <uapi/asm/signal.h>
+#include <linux/errno.h>
+
+#define __LOWER(x) (x & 0xffffffff)
+#define __UPPER(x) (x >> 32)
+
+/*
+ * Create a data structure for collecting event data
+ */
+struct data_t {
+    char comm[TASK_COMM_LEN];
+    u32 uid;
+    u32 gid;
+    u32 pid;
+    u32 targetuid;
+    u32 targetpid;
+    int signo;
+    int allowed;
+};
+
+/*
+ * Create a buffer for sending event data to userspace
+ */
+BPF_PERF_OUTPUT(events);
+
+/*
+ * Attach to the "task_kill" LSM hook
+ */
+LSM_PROBE(task_kill, struct task_struct *p, struct kernel_siginfo *info,
+    int sig, const struct cred *cred) {
+    
+    u64 gid_uid;
+    u64 pid_tgid;
+    int signo;
+
+    /*
+     * Check if the signal is SIGKILL or SIGTERM
+     */
+    signo = info->si_signo;
+    if (signo == SIGKILL || signo == SIGTERM) {
+
+        /*
+         * Gather event data
+         */
+        struct data_t data = {};
+        u64 gid_uid = bpf_get_current_uid_gid();
+        u64 pid_tgid = bpf_get_current_pid_tgid();
+        bpf_get_current_comm(&data.comm, sizeof(data.comm));
+        data.uid = __LOWER(gid_uid);
+        data.gid = __UPPER(gid_uid);
+        data.pid = __UPPER(pid_tgid);
+        data.targetuid = p->cred->uid.val;
+        data.targetpid = p->pid;
+        data.signo = signo;
+
+        /*
+         * Optional filters (Populated by Python script)
+         */
+        KERNEL_FILTER
+        ETERNAL_POLICY
+
+        if (
+        1
+        UID_FILTER
+        PID_FILTER
+        TARGET_FILTER
+        ) {
+            data.allowed = 0;
+            events.perf_submit(ctx, &data, sizeof(data));
+            return -EPERM;
+        } else {
+            data.allowed = 1;
+            events.perf_submit(ctx, &data, sizeof(data));
+        }
+    }
+    return 0;
+}
+"""
+
+
+# Populate filters in the BPF program, based on options passed to this script
+if args.kernel:
+    bpf_text = bpf_text.replace('KERNEL_FILTER', '')
+else:
+    always_allow_kernel = """
+        /*
+         * Allow all signals originating from the kernel
+         */
+        if ((long)info == 1 || SI_FROMKERNEL(info)) {
+            data.allowed = 1;
+            events.perf_submit(ctx, &data, sizeof(data));
+            return 0;
+        }
+    """
+    bpf_text = bpf_text.replace('KERNEL_FILTER', always_allow_kernel)
+
+if args.eternal:
+    eternal_policy = """
+        /*
+         * Only allow the parent process of mac_killtasks to send SIGKILL/SIGTERM to it
+         */
+        if (data.targetpid == %s && data.pid != %s) {
+            data.allowed = 0;
+            events.perf_submit(ctx, &data, sizeof(data));
+            return -EPERM;
+        }
+    """ % (os.getpid(), os.getppid())
+    bpf_text = bpf_text.replace('ETERNAL_POLICY', eternal_policy)
+else:
+    bpf_text = bpf_text.replace('ETERNAL_POLICY', '')
+
+if args.user:
+    bpf_text = bpf_text.replace('UID_FILTER', '&& (data.targetuid ALLOW_OR_DENY %s)' % args.user)
+elif args.exclude_user:
+    bpf_text = bpf_text.replace('UID_FILTER', '&& (data.targetuid INVERSE %s)' % args.exclude_user)
+else:
+    bpf_text = bpf_text.replace('UID_FILTER', '')
+
+if args.source_pid:
+    bpf_text = bpf_text.replace('PID_FILTER', '&& (data.pid ALLOW_OR_DENY %s)' % args.source_pid)
+elif args.exclude_source_pid:
+    bpf_text = bpf_text.replace('PID_FILTER', '&& (data.pid INVERSE %s)' % args.exclude_source_pid)
+else:
+    bpf_text = bpf_text.replace('PID_FILTER', '')
+
+if args.target_pid:
+    bpf_text = bpf_text.replace('TARGET_FILTER', '&& (data.targetpid ALLOW_OR_DENY %s)' % args.target_pid)
+elif args.exclude_target_pid:
+    bpf_text = bpf_text.replace('TARGET_FILTER', '&& (data.targetpid INVERSE %s)' % args.exclude_target_pid)
+else:
+    bpf_text = bpf_text.replace('TARGET_FILTER', '')
+
+if args.allow:
+    bpf_text = bpf_text.replace('ALLOW_OR_DENY', '!=')
+    bpf_text = bpf_text.replace('INVERSE', '==')
+elif args.deny:
+    bpf_text = bpf_text.replace('ALLOW_OR_DENY', '==')
+    bpf_text = bpf_text.replace('INVERSE', '!=')
+
+
+# Compiler the BPF program and attach it to the LSM hook
+b = BPF(text=bpf_text)
+
+
+def print_event(cpu, data, size):
+    """
+    Print event data when a kill signal is about to be
+    sent.
+    """
+    event = b["events"].event(data)
+    printb(b"%s type=sgkill comm=%s uid=%d gid=%d pid=%d targetuid=%d targetpid=%d signo=%d action=%s" % (
+    	   datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+           event.comm,
+           event.uid,
+           event.gid,
+           event.pid,
+           event.targetuid, 
+           event.targetpid, 
+           event.signo,
+           "allow" if event.allowed else "deny"))
+
+
+#setup callback function for the buffer
+b["events"].open_perf_buffer(print_event)
+
+
+# Poll for incoming events
+while 1:
+    try:
+        b.perf_buffer_poll()
+    except KeyboardInterrupt:
+        exit()
