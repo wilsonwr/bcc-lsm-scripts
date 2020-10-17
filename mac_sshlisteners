@@ -98,7 +98,7 @@ struct data_t {
     u32 pid;
     unsigned short family;
     u16 protocol;
-    short lport;
+    unsigned short lport;
     long laddr4;
     unsigned __int128 laddr6;
     int allowed;
@@ -190,7 +190,7 @@ def print_event(cpu, data, size):
     Print event data for an IPv4/IPv6 socket listen attempt.
     """
     event = b["events"].event(data)
-    printb(b"%s type=listen comm=%s uid=%d gid=%d pid=%d proto=%d laddr=%s lport=%d action=%s" % (
+    printb(b"%s type=listen comm=%s uid=%d gid=%d pid=%d proto=%d laddr=%s lport=%u action=%s" % (
         datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         event.comm,
         event.uid,
