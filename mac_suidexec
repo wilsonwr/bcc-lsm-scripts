@@ -8,10 +8,8 @@ from bcc import BPF
 from bcc.utils import printb
 import argparse
 import datetime
-import grp
 import os
 import pwd
-import stat
 
 
 def parse_uid(user):

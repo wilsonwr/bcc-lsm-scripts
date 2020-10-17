@@ -9,7 +9,6 @@ from bcc import BPF
 from bcc.utils import printb
 import argparse
 import datetime
-import grp
 import pwd
 import socket
 from socket import inet_ntop, AF_INET, AF_INET6
