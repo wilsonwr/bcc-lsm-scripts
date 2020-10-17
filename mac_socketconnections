@@ -101,7 +101,7 @@ struct data_t {
     u32 pid;
     u16 sk_protocol;
     long daddr;
-    short dport;
+    unsigned short dport;
     int allowed;
 };
 
@@ -203,7 +203,7 @@ def print_event(cpu, data, size):
     Print event data for a socket connection.
     """
     event = b["events"].event(data)
-    printb(b"%s type=skconn comm=%s uid=%d gid=%d pid=%d proto=%d daddr=%s dport=%d action=%s" % (
+    printb(b"%s type=skconn comm=%s uid=%d gid=%d pid=%d proto=%d daddr=%s dport=%u action=%s" % (
         datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         event.comm,
         event.uid,
