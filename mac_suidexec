@@ -133,6 +133,7 @@ LSM_PROBE(bprm_check_security, struct linux_binprm *bprm) {
         1
         UID_FILTER
         FILE_FILTER
+        DEFAULT_ALLOW
         ) {
             data.allowed = 0;
             events.perf_submit(ctx, &data, sizeof(data));
@@ -169,6 +170,10 @@ if args.allow:
     else:
         bpf_text = bpf_text.replace('FILE_FILTER', '')
 
+    # Force a universal allow if only '-A' is specified
+    if not args.user and not args.exclude_user and not args.file_path and not args.exclude_file:
+        bpf_text = bpf_text.replace('DEFAULT_ALLOW', '&& 0')
+
 elif args.deny:
     if args.user:
         bpf_text = bpf_text.replace('UID_FILTER',
@@ -189,6 +194,8 @@ elif args.deny:
                                     '&& !((data.dev == %s) && (data.inode == %s))' % (file_o.st_dev, file_o.st_ino))
     else:
         bpf_text = bpf_text.replace('FILE_FILTER', '')
+
+bpf_text = bpf_text.replace('DEFAULT_ALLOW', '')
 
 
 # Compiler the BPF program and attach it to the LSM hook

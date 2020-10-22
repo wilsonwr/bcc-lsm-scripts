@@ -135,6 +135,7 @@ LSM_PROBE(inode_create, struct inode *dir, struct dentry *dentry,
         if (
         1
         UID_FILTER
+        DEFAULT_ALLOW
         ) {
             data.allowed = 0;
             creat_events.perf_submit(ctx, &data, sizeof(data));
@@ -180,6 +181,7 @@ LSM_PROBE(path_chmod, const struct path *path, umode_t mode) {
         if (
         1
         UID_FILTER
+        DEFAULT_ALLOW
         ) {
             data.allowed = 0;
             chmod_events.perf_submit(ctx, &data, sizeof(data));
@@ -205,9 +207,16 @@ else:
 if args.allow:
     bpf_text = bpf_text.replace('ALLOW_OR_DENY', '!=')
     bpf_text = bpf_text.replace('INVERSE', '==')
+
+    #Force a universal allow if only -A is specified
+    if not args.user and not args.exclude_user:
+        bpf_text = bpf_text.replace('DEFAULT_ALLOW', '&& 0')
+
 elif args.deny:
     bpf_text = bpf_text.replace('ALLOW_OR_DENY', '==')
     bpf_text = bpf_text.replace('INVERSE', '!=')
+
+bpf_text = bpf_text.replace('DEFAULT_ALLOW', '')
 
 
 # Compile the BPF program and attach it to the LSM hooks
