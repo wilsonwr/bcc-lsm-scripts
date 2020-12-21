@@ -50,10 +50,10 @@ def long2ip(num):
 
 # Set up argument parser
 examples = """examples:
-    ./mac_socketconnections -A 192.168.15.0 -m 255.255.255.0 # Only allow socket connections to 192.168.15.0/24
-    ./mac_socketconnections -A 1.2.3.4 -u 1000               # Only allow UID 1000 to make socket connections to 1.2.3.4
-    ./mac_socketconnections -A 1.2.3.4 -U 1000               # Allow any UID except 1000 to make socket connections to 1.2.3.4
-    ./mac_socketconnections -D 10.1.2.3                      # Deny all socket connections to 10.1.2.3
+    ./mac_skconnections -A 192.168.15.0 -m 255.255.255.0 # Only allow socket connections to 192.168.15.0/24
+    ./mac_skconnections -A 1.2.3.4 -u 1000               # Only allow UID 1000 to make socket connections to 1.2.3.4
+    ./mac_skconnections -A 1.2.3.4 -U 1000               # Allow any UID except 1000 to make socket connections to 1.2.3.4
+    ./mac_skconnections -D 10.1.2.3                      # Deny all socket connections to 10.1.2.3
 """
 
 parser = argparse.ArgumentParser(

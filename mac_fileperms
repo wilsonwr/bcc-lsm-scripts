@@ -42,7 +42,7 @@ examples = """examples:
 """
 
 parser = argparse.ArgumentParser(
-    description="Dynamically load a MAC policy for socket listen operations",
+    description="Dynamically load a MAC policy for SUID/WOTH permission bits",
     formatter_class=argparse.RawDescriptionHelpFormatter,
     epilog=examples)
 mode = parser.add_mutually_exclusive_group(required=True)

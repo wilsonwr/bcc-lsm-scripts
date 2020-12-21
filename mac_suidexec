@@ -46,7 +46,7 @@ examples = """examples:
 """
 
 parser = argparse.ArgumentParser(
-    description="Dynamically load a MAC policy for committing new credentials",
+    description="Dynamically load a MAC policy for executing SUID binaries",
     formatter_class=argparse.RawDescriptionHelpFormatter,
     epilog=examples)
 mode = parser.add_mutually_exclusive_group(required=True)
